@@ -1,0 +1,32 @@
+# RadiologySTT — Python dependencies
+# Install with:  pip install -r requirements.txt
+#
+# Platform notes
+# ──────────────
+#  keyboard  → Windows / Linux only.  Do NOT install on macOS.
+#  pynput    → macOS (and Linux).     Safe to install on Windows but not used.
+#  winsound  → stdlib on Windows; no separate install needed.
+#  afplay    → macOS built-in CLI tool; no install needed.
+
+# ── Google Cloud Speech-to-Text ───────────────────────────────────────────────
+google-cloud-speech>=2.21.0
+
+# ── Audio capture ─────────────────────────────────────────────────────────────
+# PyAudio wraps PortAudio.
+#   Windows: pip install pyaudio  (pre-built wheel available on PyPI)
+#   macOS:   brew install portaudio && pip install pyaudio
+PyAudio>=0.2.14
+
+# ── Text injection (shared) ───────────────────────────────────────────────────
+pyautogui>=0.9.54
+pyperclip>=1.8.2
+
+# ── Push-to-talk hotkey — Windows only ───────────────────────────────────────
+# Requires running the script as Administrator (or with elevated privileges)
+# for the global keyboard hook to work.
+keyboard>=0.13.5
+
+# ── Push-to-talk hotkey — macOS only ─────────────────────────────────────────
+# The Terminal (or whichever app launches the script) must have Accessibility
+# permission: System Settings → Privacy & Security → Accessibility
+pynput>=1.7.6
