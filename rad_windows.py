@@ -105,6 +105,61 @@ def process_punctuation(text: str) -> str:
     return text
 
 
+# ── Measurement / dimension normalisation ─────────────────────────────────────
+# Handles the most common radiology measurement patterns that the model either
+# leaves in spoken form or doesn't abbreviate.
+
+_UNIT_MAP = [
+    (r"\bcentimeters?\b",       "cm"),
+    (r"\bcentimetres?\b",       "cm"),
+    (r"\bmillimeters?\b",       "mm"),
+    (r"\bmillimetres?\b",       "mm"),
+    (r"\bkilometers?\b",        "km"),
+    (r"\bkilometres?\b",        "km"),
+    (r"\bmilligrams?\b",        "mg"),
+    (r"\bmicrograms?\b",        "mcg"),
+    (r"\bnanograms?\b",         "ng"),
+    (r"\bkilograms?\b",         "kg"),
+    (r"\bgrams?\b",             "g"),
+    (r"\bmilliliters?\b",       "mL"),
+    (r"\bmillilitres?\b",       "mL"),
+    (r"\bliters?\b",            "L"),
+    (r"\blitres?\b",            "L"),
+    (r"\bmegahertz\b",          "MHz"),
+    (r"\bkilohertz\b",          "kHz"),
+    (r"\bhounsfield\s+units?\b","HU"),
+    (r"\bsecond[s]?\b",         "s"),
+    (r"\bmilliseconds?\b",      "ms"),
+]
+
+# Matches integers and decimals (e.g. 2, 2.5, 0.8)
+_NUM = r"\d+(?:\.\d+)?"
+
+def process_measurements(text: str) -> str:
+    """
+    1. Spoken decimal  : "2 point 5"       → "2.5"
+    2. Dimension string: "2 by 3 by 1.5"   → "2 × 3 × 1.5"
+                         "2 x 3"           → "2 × 3"
+    3. Unit names      : "centimeters"     → "cm", "milligrams" → "mg", etc.
+    """
+    # Spoken decimal: must be digits on both sides so "the point is" is unaffected
+    text = re.sub(r"\b(\d+)\s+point\s+(\d+)\b", r"\1.\2", text, flags=re.IGNORECASE)
+
+    # Dimension separators: iterate until stable (handles 3-D chains like 2×3×4)
+    _dim = re.compile(rf"({_NUM})\s+(?:by|x)\s+({_NUM})", re.IGNORECASE)
+    while True:
+        updated = _dim.sub(r"\1 × \2", text)
+        if updated == text:
+            break
+        text = updated
+
+    # Unit abbreviation
+    for pattern, abbrev in _UNIT_MAP:
+        text = re.sub(pattern, abbrev, text, flags=re.IGNORECASE)
+
+    return text
+
+
 # ── Device discovery ──────────────────────────────────────────────────────────
 
 def find_philips_device(pa: pyaudio.PyAudio) -> Optional[int]:
@@ -259,7 +314,7 @@ def listen_and_type(
 
                 if result.is_final:
                     raw = result.alternatives[0].transcript.strip()
-                    transcript = process_punctuation(raw)
+                    transcript = process_measurements(process_punctuation(raw))
                     if transcript:
                         confidence = result.alternatives[0].confidence
                         print(f"  --> (conf={confidence:.2f}) {transcript}")
