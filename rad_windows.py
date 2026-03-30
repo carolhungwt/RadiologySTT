@@ -8,14 +8,13 @@ cursor position in whichever window currently has focus.
 
 Requirements:
   - Python 3.9+
-  - GOOGLE_APPLICATION_CREDENTIALS env var pointing to your service-account JSON
   - See requirements.txt for package dependencies
 """
 
 import os
+import re
 import sys
 import queue
-import threading
 import time
 import winsound
 from typing import Optional
@@ -25,19 +24,85 @@ import pyaudio
 import pyautogui
 import pyperclip
 from google.cloud import speech
+from google.protobuf import wrappers_pb2
 
-# ── Audio configuration ───────────────────────────────────────────────────────
+# ── CONFIGURATION ─────────────────────────────────────────────────────────────
+
+# Path to your Google Cloud service-account JSON key.
+# Fill this in directly, or leave empty and set GOOGLE_APPLICATION_CREDENTIALS
+# as an environment variable before running.
+CREDENTIALS_PATH = r""   # e.g. r"C:\Users\carol\credentials\radiology-stt-key.json"
+
+RECORD_HOTKEY = "F9"
+
+# ── Audio settings ─────────────────────────────────────────────────────────────
 RATE = 16_000
-CHUNK = int(RATE / 10)      # 1 600 samples = 100 ms per chunk
-CHANNELS = 1
-FORMAT = pyaudio.paInt16
+CHUNK = int(RATE / 10)   # 1 600 samples = 100 ms per chunk
 
 # ── Auditory cues (frequency Hz, duration ms) ─────────────────────────────────
-BEEP_START = (880, 150)     # high tone — recording starts
-BEEP_STOP  = (440, 150)     # low  tone — recording stops
+BEEP_START = (700, 200)  # high tone — recording starts
+BEEP_STOP  = (500, 200)  # low  tone — recording stops (plays after last word types)
 
-# Prevent pyautogui from raising an exception if the mouse reaches a screen corner
 pyautogui.FAILSAFE = False
+
+if CREDENTIALS_PATH:
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = CREDENTIALS_PATH
+
+
+# ── Spoken punctuation map ─────────────────────────────────────────────────────
+# Google's medical_dictation model tags spoken punctuation as [full stop] etc.
+# enable_spoken_punctuation asks the API to convert them, but we also post-process
+# locally as a reliable fallback for any that slip through.
+#
+# Patterns are tried in order — most specific first.
+# Only unambiguous commands are included to avoid corrupting real medical words.
+
+_PUNCT = [
+    # Google's bracket-tag format.
+    # \s* handles the spaces the model sometimes inserts: [ full stop ] or [full stop]
+    (r"\[\s*full\s*stop\s*\]",          "."),
+    (r"\[\s*period\s*\]",               "."),
+    (r"\[\s*comma\s*\]",                ","),
+    (r"\[\s*semicolon\s*\]",            ";"),
+    (r"\[\s*colon\s*\]",                ":"),
+    (r"\[\s*question\s*mark\s*\]",      "?"),
+    (r"\[\s*exclamation\s*mark\s*\]",   "!"),
+    (r"\[\s*exclamation\s*point\s*\]",  "!"),
+    (r"\[\s*hyphen\s*\]",               "-"),
+    (r"\[\s*dash\s*\]",                 " \u2014 "),   # em dash
+    (r"\[\s*slash\s*\]",                "/"),
+    (r"\[\s*open\s*bracket\s*\]",       "("),
+    (r"\[\s*close\s*bracket\s*\]",      ")"),
+    (r"\[\s*open\s*parenthesis\s*\]",   "("),
+    (r"\[\s*close\s*parenthesis\s*\]",  ")"),
+    (r"\[\s*new\s*line\s*\]",           "\n"),
+    (r"\[\s*next\s*line\s*\]",          "\n"),   # "next line" is the common spoken form
+    (r"\[\s*new\s*paragraph\s*\]",      "\n\n"),
+    (r"\[\s*next\s*paragraph\s*\]",     "\n\n"),
+    # Plain spoken phrases (unambiguous in a radiology context)
+    (r"\bfull\s+stop\b",                "."),
+    (r"\bnew\s+line\b",                 "\n"),
+    (r"\bnext\s+line\b",                "\n"),
+    (r"\bnew\s+paragraph\b",            "\n\n"),
+    (r"\bnext\s+paragraph\b",           "\n\n"),
+]
+
+def process_punctuation(text: str) -> str:
+    """Convert spoken/tagged punctuation commands to their symbols,
+    then capitalise the first letter of the transcript and the first
+    letter after any sentence-ending punctuation (. ? !)."""
+    for pattern, replacement in _PUNCT:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    # Remove spurious spaces immediately before punctuation marks
+    text = re.sub(r" +([.,;:!?])", r"\1", text)
+    # Collapse multiple spaces
+    text = re.sub(r"  +", " ", text).strip()
+    # Capitalise after . ? ! (followed by a space and a lowercase letter)
+    text = re.sub(r"([.?!]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), text)
+    # Capitalise the very first character
+    if text:
+        text = text[0].upper() + text[1:]
+    return text
 
 
 # ── Device discovery ──────────────────────────────────────────────────────────
@@ -65,57 +130,58 @@ def find_philips_device(pa: pyaudio.PyAudio) -> Optional[int]:
 class MicrophoneStream:
     """
     Opens a non-blocking PyAudio input stream and exposes a generator that
-    yields raw PCM bytes. Thread-safe via an internal queue.
+    yields raw PCM bytes.
+
+    Stopping contract:
+      Caller sets self.closed = True and puts None in self._buff.
+      The generator then terminates, the gRPC request stream ends, Google Speech
+      flushes any remaining audio and returns the final is_final result, and the
+      response stream closes naturally — no forced break needed.
     """
 
     def __init__(self, rate: int, chunk: int, device_index: Optional[int] = None):
-        self.rate = rate
-        self.chunk = chunk
-        self.device_index = device_index
+        self._rate = rate
+        self._chunk = chunk
+        self._device_index = device_index
         self._buff: "queue.Queue[Optional[bytes]]" = queue.Queue()
-        self._pa: Optional[pyaudio.PyAudio] = None
-        self._stream = None
+        self._audio_interface: Optional[pyaudio.PyAudio] = None
+        self._audio_stream = None
         self.closed = True
 
     def __enter__(self) -> "MicrophoneStream":
-        self._pa = pyaudio.PyAudio()
+        self._audio_interface = pyaudio.PyAudio()
         kwargs = dict(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=self.rate,
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=self._rate,
             input=True,
-            frames_per_buffer=self.chunk,
+            frames_per_buffer=self._chunk,
             stream_callback=self._fill_buffer,
         )
-        if self.device_index is not None:
-            kwargs["input_device_index"] = self.device_index
-        self._stream = self._pa.open(**kwargs)
+        if self._device_index is not None:
+            kwargs["input_device_index"] = self._device_index
+        self._audio_stream = self._audio_interface.open(**kwargs)
         self.closed = False
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self._stream:
-            self._stream.stop_stream()
-            self._stream.close()
+    def __exit__(self, type, value, traceback):
+        self._audio_stream.stop_stream()
+        self._audio_stream.close()
         self.closed = True
-        self._buff.put(None)        # sentinel — unblocks the generator
-        if self._pa:
-            self._pa.terminate()
+        self._buff.put(None)
+        self._audio_interface.terminate()
 
     def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
         self._buff.put(in_data)
         return None, pyaudio.paContinue
 
-    def generator(self, stop_event: threading.Event):
-        """Yield audio chunks until the stream closes or stop_event is set."""
+    def generator(self):
+        """Yield audio chunks until the stream closes."""
         while not self.closed:
-            if stop_event.is_set():
-                return
             chunk = self._buff.get()
             if chunk is None:
                 return
             data = [chunk]
-            # Drain any extra buffered chunks without blocking
             while True:
                 try:
                     chunk = self._buff.get(block=False)
@@ -131,68 +197,78 @@ class MicrophoneStream:
 
 def type_text(text: str) -> None:
     """
-    Paste text at the current cursor position via the system clipboard.
-    Clipboard-paste is faster and handles all Unicode / medical symbols
-    reliably, unlike pyautogui.typewrite() which is ASCII-only.
-    The original clipboard content is restored afterwards.
+    Paste text at the current cursor position via the clipboard.
+    Faster and more reliable than pyautogui.write() for medical terminology,
+    punctuation, and Unicode. Restores the previous clipboard content.
     """
     previous = pyperclip.paste()
     try:
         pyperclip.copy(text)
         pyautogui.hotkey("ctrl", "v")
-        time.sleep(0.05)            # brief pause so the paste registers
+        time.sleep(0.05)
     finally:
-        pyperclip.copy(previous)    # always restore the clipboard
+        pyperclip.copy(previous)
 
 
 # ── Transcription session ─────────────────────────────────────────────────────
 
-def run_transcription(
+def listen_and_type(
     client: speech.SpeechClient,
     streaming_config: speech.StreamingRecognitionConfig,
     device_index: Optional[int],
 ) -> None:
     """
-    Open a single push-to-talk recording session.
-    Streams audio to Google Cloud Speech-to-Text until F9 is released.
-    Types each is_final transcript at the active cursor position.
-    """
-    stop_event = threading.Event()
+    One push-to-talk recording session.
 
+    Flow:
+      F9 held   → audio streams to Google Speech in real time
+      F9 released → on_f9_release closes the mic only (stops sending audio)
+                    Google flushes the remaining audio buffer and returns the
+                    final is_final result, then closes the response stream.
+                    The for-loop ends naturally — no forced break.
+      Beep plays AFTER the last word has been typed, not before.
+    """
     with MicrophoneStream(RATE, CHUNK, device_index) as stream:
 
-        def _monitor_f9():
-            """Signal stop when the user releases F9."""
-            while keyboard.is_pressed("F9"):
-                time.sleep(0.02)
-            stop_event.set()
+        def on_f9_release(e):
+            # Stop sending audio — do NOT break the response loop yet.
+            # Google Speech will process whatever it already received, return
+            # the is_final result, then close the stream on its own.
             stream.closed = True
             stream._buff.put(None)
 
-        threading.Thread(target=_monitor_f9, daemon=True).start()
-
-        requests = (
-            speech.StreamingRecognizeRequest(audio_content=audio)
-            for audio in stream.generator(stop_event)
-        )
+        hook = keyboard.on_release_key(RECORD_HOTKEY, on_f9_release)
 
         try:
-            for response in client.streaming_recognize(streaming_config, requests):
-                if stop_event.is_set():
-                    break
+            audio_generator = stream.generator()
+            requests = (
+                speech.StreamingRecognizeRequest(audio_content=content)
+                for content in audio_generator
+            )
+
+            responses = client.streaming_recognize(streaming_config, requests)
+
+            # Iterate until gRPC closes the stream (happens naturally after
+            # the request stream ends and Google returns the final result).
+            for response in responses:
                 if not response.results:
                     continue
                 result = response.results[0]
-                if result.is_final and result.alternatives:
-                    transcript = result.alternatives[0].transcript.strip()
+                if not result.alternatives:
+                    continue
+
+                if result.is_final:
+                    raw = result.alternatives[0].transcript.strip()
+                    transcript = process_punctuation(raw)
                     if transcript:
                         confidence = result.alternatives[0].confidence
-                        print(f"[transcript] (conf={confidence:.2f}) {transcript}")
+                        print(f"  --> (conf={confidence:.2f}) {transcript}")
                         type_text(transcript + " ")
+
         except Exception as exc:
-            # Streaming errors (e.g. 5-minute limit) are non-fatal;
-            # the user simply presses F9 again to start a fresh session.
             print(f"[error] Streaming ended: {exc}", file=sys.stderr)
+        finally:
+            keyboard.unhook(hook)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -203,7 +279,7 @@ def main() -> None:
     device_index = find_philips_device(pa)
     pa.terminate()
 
-    # Build the Google Cloud Speech client and config once (reused every session)
+    # Build Google Speech client and config once; reused on every F9 press
     client = speech.SpeechClient()
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
@@ -211,31 +287,36 @@ def main() -> None:
         language_code="en-US",
         model="medical_dictation",
         use_enhanced=True,
+        enable_automatic_punctuation=True,
+        # Ask Google to convert spoken punctuation ("full stop" → ".") at source
+        enable_spoken_punctuation=wrappers_pb2.BoolValue(value=True),
     )
     streaming_config = speech.StreamingRecognitionConfig(
         config=config,
-        interim_results=True,    # stream partial results (only finals are typed)
+        interim_results=True,
     )
 
-    print("=" * 58)
-    print("  RadiologySTT — Windows  |  Hold F9 to dictate")
-    print("  Ctrl+C to exit")
-    print("=" * 58)
+    print("\n--- RADIOLOGY DICTATION (WINDOWS) ---")
+    print("1. Open your Radiology Reporting Window.")
+    print(f"2. Hold [{RECORD_HOTKEY}] to dictate.")
+    print("3. Release to stop — text types after the last word. Ctrl+C to exit.\n")
 
-    try:
-        while True:
-            keyboard.wait("F9")                     # block until F9 is pressed
-            winsound.Beep(*BEEP_START)              # high beep — recording starts
-            print("[status] Recording …")
+    while True:
+        try:
+            keyboard.wait(RECORD_HOTKEY)
+            winsound.Beep(*BEEP_START)
+            print(f"  [ON] Listening... Release {RECORD_HOTKEY} to stop.")
 
-            run_transcription(client, streaming_config, device_index)
+            listen_and_type(client, streaming_config, device_index)
 
-            winsound.Beep(*BEEP_STOP)               # low beep  — recording stops
-            print("[status] Stopped.\n")
-            time.sleep(0.15)                        # debounce before next press
+            # Beep plays only after gRPC has closed and all text has been typed
+            winsound.Beep(*BEEP_STOP)
+            print("  [OFF] Done.\n")
+            time.sleep(0.2)
 
-    except KeyboardInterrupt:
-        print("\n[status] Exiting.")
+        except KeyboardInterrupt:
+            print("\n[status] Exiting.")
+            break
 
 
 if __name__ == "__main__":

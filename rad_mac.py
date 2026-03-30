@@ -8,7 +8,6 @@ cursor position in whichever window currently has focus.
 
 Requirements:
   - Python 3.9+
-  - GOOGLE_APPLICATION_CREDENTIALS env var pointing to your service-account JSON
   - See requirements.txt for package dependencies
 
 macOS Accessibility Note:
@@ -18,6 +17,7 @@ macOS Accessibility Note:
 """
 
 import os
+import re
 import sys
 import queue
 import threading
@@ -29,6 +29,14 @@ import pyautogui
 import pyperclip
 from pynput import keyboard as pynput_keyboard
 from google.cloud import speech
+from google.protobuf import wrappers_pb2
+
+# ── CONFIGURATION ─────────────────────────────────────────────────────────────
+
+# Path to your Google Cloud service-account JSON key.
+# Fill this in directly, or leave empty and set GOOGLE_APPLICATION_CREDENTIALS
+# as an environment variable before running.
+CREDENTIALS_PATH = ""   # e.g. "/Users/carol/.credentials/radiology-stt-key.json"
 
 # ── Audio configuration ───────────────────────────────────────────────────────
 RATE = 16_000
@@ -41,8 +49,64 @@ FORMAT = pyaudio.paInt16
 SOUND_START = "/System/Library/Sounds/Tink.aiff"   # high tone — recording starts
 SOUND_STOP  = "/System/Library/Sounds/Pop.aiff"    # low  tone — recording stops
 
-# Prevent pyautogui from raising an exception if the mouse reaches a screen corner
 pyautogui.FAILSAFE = False
+
+if CREDENTIALS_PATH:
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = CREDENTIALS_PATH
+
+
+# ── Spoken punctuation map ─────────────────────────────────────────────────────
+# Google's medical_dictation model tags spoken punctuation as [full stop] etc.
+# enable_spoken_punctuation asks the API to convert them, but we also post-process
+# locally as a reliable fallback for any that slip through.
+#
+# \s* inside brackets handles the spaces the model sometimes inserts:
+# [ full stop ] or [full stop] — both are matched.
+
+_PUNCT = [
+    (r"\[\s*full\s*stop\s*\]",          "."),
+    (r"\[\s*period\s*\]",               "."),
+    (r"\[\s*comma\s*\]",                ","),
+    (r"\[\s*semicolon\s*\]",            ";"),
+    (r"\[\s*colon\s*\]",                ":"),
+    (r"\[\s*question\s*mark\s*\]",      "?"),
+    (r"\[\s*exclamation\s*mark\s*\]",   "!"),
+    (r"\[\s*exclamation\s*point\s*\]",  "!"),
+    (r"\[\s*hyphen\s*\]",               "-"),
+    (r"\[\s*dash\s*\]",                 " \u2014 "),   # em dash
+    (r"\[\s*slash\s*\]",                "/"),
+    (r"\[\s*open\s*bracket\s*\]",       "("),
+    (r"\[\s*close\s*bracket\s*\]",      ")"),
+    (r"\[\s*open\s*parenthesis\s*\]",   "("),
+    (r"\[\s*close\s*parenthesis\s*\]",  ")"),
+    (r"\[\s*new\s*line\s*\]",           "\n"),
+    (r"\[\s*next\s*line\s*\]",          "\n"),
+    (r"\[\s*new\s*paragraph\s*\]",      "\n\n"),
+    (r"\[\s*next\s*paragraph\s*\]",     "\n\n"),
+    # Plain spoken phrases (unambiguous in a radiology context)
+    (r"\bfull\s+stop\b",                "."),
+    (r"\bnew\s+line\b",                 "\n"),
+    (r"\bnext\s+line\b",                "\n"),
+    (r"\bnew\s+paragraph\b",            "\n\n"),
+    (r"\bnext\s+paragraph\b",           "\n\n"),
+]
+
+def process_punctuation(text: str) -> str:
+    """Convert spoken/tagged punctuation commands to their symbols,
+    then capitalise the first letter of the transcript and the first
+    letter after any sentence-ending punctuation (. ? !)."""
+    for pattern, replacement in _PUNCT:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    # Remove spurious spaces immediately before punctuation marks
+    text = re.sub(r" +([.,;:!?])", r"\1", text)
+    # Collapse multiple spaces
+    text = re.sub(r"  +", " ", text).strip()
+    # Capitalise after . ? ! (followed by a space and a lowercase letter)
+    text = re.sub(r"([.?!]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), text)
+    # Capitalise the very first character
+    if text:
+        text = text[0].upper() + text[1:]
+    return text
 
 
 # ── Microphone stream ─────────────────────────────────────────────────────────
@@ -51,7 +115,12 @@ class MicrophoneStream:
     """
     Opens a non-blocking PyAudio input stream using the system default
     microphone and exposes a generator that yields raw PCM bytes.
-    Thread-safe via an internal queue.
+
+    Stopping contract:
+      Caller sets self.closed = True and puts None in self._buff.
+      The generator terminates, the gRPC request stream ends, Google Speech
+      flushes remaining audio and returns the final is_final result, then the
+      response stream closes naturally — no forced break needed.
     """
 
     def __init__(self, rate: int, chunk: int):
@@ -80,7 +149,7 @@ class MicrophoneStream:
             self._stream.stop_stream()
             self._stream.close()
         self.closed = True
-        self._buff.put(None)        # sentinel — unblocks the generator
+        self._buff.put(None)
         if self._pa:
             self._pa.terminate()
 
@@ -88,16 +157,13 @@ class MicrophoneStream:
         self._buff.put(in_data)
         return None, pyaudio.paContinue
 
-    def generator(self, stop_event: threading.Event):
-        """Yield audio chunks until the stream closes or stop_event is set."""
+    def generator(self):
+        """Yield audio chunks until the stream closes."""
         while not self.closed:
-            if stop_event.is_set():
-                return
             chunk = self._buff.get()
             if chunk is None:
                 return
             data = [chunk]
-            # Drain any extra buffered chunks without blocking
             while True:
                 try:
                     chunk = self._buff.get(block=False)
@@ -121,28 +187,34 @@ def type_text(text: str) -> None:
     try:
         pyperclip.copy(text)
         pyautogui.hotkey("command", "v")
-        time.sleep(0.05)            # brief pause so the paste registers
+        time.sleep(0.05)
     finally:
-        pyperclip.copy(previous)    # always restore the clipboard
+        pyperclip.copy(previous)
 
 
 # ── Transcription session ─────────────────────────────────────────────────────
 
-def run_transcription(
+def listen_and_type(
     client: speech.SpeechClient,
     streaming_config: speech.StreamingRecognitionConfig,
     stop_event: threading.Event,
 ) -> None:
     """
-    Open a single push-to-talk recording session.
-    Streams audio to Google Cloud Speech-to-Text until stop_event is set
-    (i.e. when the pynput on_release callback fires for F9).
-    Types each is_final transcript at the active cursor position.
+    One push-to-talk recording session.
+
+    Flow:
+      F9 held     → audio streams to Google Speech in real time.
+      F9 released → stop_event is set by the pynput on_release callback.
+                    _watch_stop thread closes the mic only (stops sending audio).
+                    Google flushes the buffer and returns the final is_final result,
+                    then closes the response stream on its own.
+                    The for-loop ends naturally — no forced break.
+      Stop sound plays AFTER the last word has been typed.
     """
     with MicrophoneStream(RATE, CHUNK) as stream:
 
         def _watch_stop():
-            """Close the stream as soon as the stop signal arrives."""
+            """Wait for F9 release, then close audio only — don't break the loop."""
             stop_event.wait()
             stream.closed = True
             stream._buff.put(None)
@@ -151,25 +223,22 @@ def run_transcription(
 
         requests = (
             speech.StreamingRecognizeRequest(audio_content=audio)
-            for audio in stream.generator(stop_event)
+            for audio in stream.generator()
         )
 
         try:
             for response in client.streaming_recognize(streaming_config, requests):
-                if stop_event.is_set():
-                    break
                 if not response.results:
                     continue
                 result = response.results[0]
                 if result.is_final and result.alternatives:
-                    transcript = result.alternatives[0].transcript.strip()
+                    raw = result.alternatives[0].transcript.strip()
+                    transcript = process_punctuation(raw)
                     if transcript:
                         confidence = result.alternatives[0].confidence
-                        print(f"[transcript] (conf={confidence:.2f}) {transcript}")
+                        print(f"  --> (conf={confidence:.2f}) {transcript}")
                         type_text(transcript + " ")
         except Exception as exc:
-            # Streaming errors (e.g. 5-minute limit) are non-fatal;
-            # the user simply presses F9 again to start a fresh session.
             print(f"[error] Streaming ended: {exc}", file=sys.stderr)
 
 
@@ -183,21 +252,22 @@ def main() -> None:
         language_code="en-US",
         model="medical_dictation",
         use_enhanced=True,
+        enable_automatic_punctuation=True,
+        enable_spoken_punctuation=wrappers_pb2.BoolValue(value=True),
     )
     streaming_config = speech.StreamingRecognitionConfig(
         config=config,
-        interim_results=True,   # stream partial results (only finals are typed)
+        interim_results=True,
     )
 
-    print("=" * 58)
-    print("  RadiologySTT — macOS  |  Hold F9 to dictate")
-    print("  Ctrl+C to exit")
-    print("=" * 58)
+    print("\n--- RADIOLOGY DICTATION (macOS) ---")
+    print("1. Open your Radiology Reporting Window.")
+    print("2. Hold [F9] to dictate.")
+    print("3. Release to stop — text types after the last word. Ctrl+C to exit.\n")
 
-    # Shared state between the pynput listener callbacks and the main loop
-    f9_pressed = threading.Event()
-    stop_event  = threading.Event()
-    session_active = threading.Event()     # guard against re-entrant presses
+    f9_pressed   = threading.Event()
+    stop_event   = threading.Event()
+    session_active = threading.Event()   # guard against re-entrant presses
 
     def on_press(key):
         if key == pynput_keyboard.Key.f9 and not session_active.is_set():
@@ -212,21 +282,21 @@ def main() -> None:
 
     try:
         while True:
-            # Block until F9 is pressed
             f9_pressed.wait()
             f9_pressed.clear()
             stop_event.clear()
             session_active.set()
 
-            os.system(f"afplay '{SOUND_START}' &")      # non-blocking start beep
-            print("[status] Recording …")
+            os.system(f"afplay '{SOUND_START}' &")
+            print("  [ON] Listening... Release F9 to stop.")
 
-            run_transcription(client, streaming_config, stop_event)
+            listen_and_type(client, streaming_config, stop_event)
 
-            os.system(f"afplay '{SOUND_STOP}' &")       # non-blocking stop beep
-            print("[status] Stopped.\n")
+            # Sound plays only after gRPC has closed and all text has been typed
+            os.system(f"afplay '{SOUND_STOP}' &")
+            print("  [OFF] Done.\n")
             session_active.clear()
-            time.sleep(0.15)                            # debounce before next press
+            time.sleep(0.15)
 
     except KeyboardInterrupt:
         listener.stop()
